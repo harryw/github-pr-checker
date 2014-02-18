@@ -210,7 +210,7 @@ func notifyPullRequest(notification PrWithToken, room string) {
 		MessageFormat: hipchat.FormatText,
 		Notify:        true,
 	}
-	fmt.Println("Sending HipChat notification:", req)
+	fmt.Println("Sending HipChat notification:", message)
 	if err := client.PostMessage(req); err != nil {
 		fmt.Println("Failed to send HipChat notification:", err)
 	}
