@@ -3,29 +3,110 @@ package main
 import (
 	"github.com/google/go-github/github"
 	"code.google.com/p/goauth2/oauth"
+	"github.com/andybons/hipchat"
 	"fmt"
 	"time"
+	"sort"
+	"flag"
 )
 
+type RepoWithToken struct {
+	Repo github.Repository
+	Token string
+}
+
+type PrWithToken struct {
+	Pr github.PullRequest
+	Token string
+}
+
+type ByCreatedAt []PrWithToken
+func (this ByCreatedAt) Len() int {
+	return len(this)
+}
+func (this ByCreatedAt) Less(i, j int) bool {
+	return this[i].Pr.CreatedAt.Before(*this[j].Pr.CreatedAt)
+}
+func (this ByCreatedAt) Swap(i, j int) {
+	this[i], this[j] = this[j], this[i]
+}
+
 func main() {
-	client := createClient("xxx")
+	var hipchatRoomName string; flag.StringVar(&hipchatRoomName, "room", "", "Exclusively notify the specified HipChat room")
+	var githubRepoToken string; flag.StringVar(&githubRepoToken, "repo-api-token", "", "GitHub API token with 'repo' scope")
+	var githubHookToken string; flag.StringVar(&githubHookToken, "hook-api-token", "", "GitHub API token with 'read:repo_hook' scope")
+	var ageThreshold int; flag.IntVar(&ageThreshold, "days", 3, "Number of days old the PR may be before considering it old")
+	flag.Parse()
 
-	fmt.Println("Recently updated repositories owned by xxx:")
+	if githubRepoToken == "" {
+		fmt.Println("Please provide a valid value for repo-api-token")
+		return
+	}
+	if githubHookToken == "" {
+		fmt.Println("Please provide a valid value for hook-api-token")
+		return
+	}
 
-	repos := getRepos(client)
-//	repo, _, _ := client.Repositories.Get("xxx", "xxx")
-//	repos := []github.Repository{*repo}
+	fmt.Println("searching for repos with HipChat hooks...")
 
-	hookReaderClient := createClient("xxx")
-	repos = roomRepos(hookReaderClient, repos, "xxx")
+	client := createClient(githubRepoToken)
 
-	for _, repo := range repos {
-		prs := getOpenPullRequests(client, repo)
-		for _, pr := range prs {
-			if pullRequestIsOld(client, pr) {
-				notifyPullRequest(client, pr)
-			}
+	repos := make(chan github.Repository, 10)
+	getReposDone := make(chan bool, 1)
+	go getRepos(client, repos, getReposDone)
+
+	confirmedRepos := make(chan RepoWithToken, 100)
+	roomReposDone := make(chan bool, 1)
+	hookReaderClient := createClient(githubHookToken)
+	go roomRepos(hookReaderClient, repos, confirmedRepos, roomReposDone, hipchatRoomName)
+
+	notifications := make(chan PrWithToken, 100)
+	notificationChecks := make(chan string, 100)
+	notificationCheckCount := 0
+
+	for {
+		repoWithToken, ok := <-confirmedRepos
+		if !ok {
+			break //channel closed
 		}
+		notificationCheckCount++
+		go func() {
+			prs := getOpenPullRequests(client, repoWithToken.Repo)
+			for _, pr := range prs {
+				if pullRequestIsOld(client, pr, ageThreshold) {
+					notifications <- PrWithToken{Pr: pr, Token: repoWithToken.Token}
+				}
+			}
+			notificationChecks <- *repoWithToken.Repo.Name
+		}()
+	}
+
+	<-getReposDone
+	<-roomReposDone
+
+	fmt.Println("\nfinished fetching repos")
+
+	for notificationCheckCount > 0 {
+		notificationCheckCount--
+		<-notificationChecks
+	}
+
+	fmt.Println("finished checking PRs")
+
+	notificationsArray := make([]PrWithToken, len(notifications))
+	notificationIndex := 0
+	for len(notifications) > 0 {
+		notificationsArray[notificationIndex] = <-notifications
+		notificationIndex++
+	}
+
+	fmt.Println("issuing", len(notificationsArray), "notifications")
+
+
+	sort.Sort(ByCreatedAt(notificationsArray))
+
+	for _, notification := range notificationsArray {
+		notifyPullRequest(notification, hipchatRoomName)
 	}
 
 	printRateLimit(client)
@@ -39,22 +120,19 @@ func createClient(token string) github.Client {
 	return *github.NewClient(t.Client())
 }
 
-func getRepos(client github.Client) []github.Repository {
-	allRepos := make([]github.Repository, 1000)
-	repoCount := 0
+func getRepos(client github.Client, repos chan github.Repository, done chan bool)  {
 	opt := &github.RepositoryListByOrgOptions{Type: "all", ListOptions:github.ListOptions{Page:1}}
 	for {
-		fmt.Println("fetching page", opt.Page)
-		repos, response, err := client.Repositories.ListByOrg("xxx", opt)
-		copy(allRepos[repoCount:repoCount+len(repos)], repos)
-		repoCount += len(repos)
-
-		if err != nil {
-			fmt.Printf("error: %v\n\n", err)
-			return []github.Repository{}
+		reposPage, response, err := client.Repositories.ListByOrg("mdsol", opt)
+		for _, repo := range reposPage {
+			repos <- repo
 		}
 
-		fmt.Println("next page is ", response.NextPage)
+		if err != nil {
+			fmt.Println("Failed to fetch repos: ", err)
+			done <- true
+		}
+
 		if (response.NextPage == 0) {
 			break
 		}
@@ -62,53 +140,81 @@ func getRepos(client github.Client) []github.Repository {
 		opt.Page++
 	}
 
-	return allRepos[:repoCount]
+	close(repos)
+	done <- true
 }
 
-func roomRepos(client github.Client, repos []github.Repository, roomName string) []github.Repository {
-	filtered := make([]github.Repository, len(repos))
-	i := 0;
-	for _, repo := range repos {
-		fmt.Println("checking repo: ", *repo.Name)
-		hooks, _, err := client.Repositories.ListHooks(*repo.Owner.Login, *repo.Name, nil)
-		if err != nil {
-			fmt.Println("Failed to fetch hooks:", err)
-			return []github.Repository{}
+func roomRepos(client github.Client, repos chan github.Repository, confirmedRepos chan RepoWithToken, done chan bool, roomName string) {
+	checkCount := 0
+	checkCompleteChan := make(chan string, 10)
+	for {
+		repo, ok := <-repos
+		if !ok {
+			break // channel is closed
 		}
-		for _, hook := range hooks {
-//			fmt.Println("found a hook:", hook)
-			if *hook.Name == "hipchat" && hook.Config["room"] == roomName {
-				fmt.Println("including repo: ", *repo.Name)
-				filtered[i] = repo
-				i++
-				break
+		checkCount++
+		go func() {
+//			fmt.Print(".")
+			hooks, _, err := client.Repositories.ListHooks(*repo.Owner.Login, *repo.Name, nil)
+			if err != nil {
+				fmt.Println("Failed to fetch hooks:", err)
+				done <- true
 			}
-		}
+			for _, hook := range hooks {
+				if *hook.Name == "hipchat" {
+						if roomName == "" || hook.Config["room"] == roomName {
+	//					fmt.Print("!")
+						confirmedRepos <- RepoWithToken{Repo: repo, Token: hook.Config["auth_token"].(string)}
+						break
+					}
+				}
+			}
+			checkCompleteChan <- *repo.Name
+		}()
 	}
-	return filtered[:i]
+	for i:=0; i<checkCount; i++ {
+		<-checkCompleteChan
+	}
+	close(confirmedRepos)
+	done <- true
 }
 
 func getOpenPullRequests(client github.Client, repo github.Repository) []github.PullRequest {
-	opts := PullRequestListOptions{State: "open"}
+	fmt.Println("Checking PRs for:", *repo.Name)
+	opts := github.PullRequestListOptions{State: "open"}
 	prs ,_ , err := client.PullRequests.List(*repo.Owner.Login, *repo.Name, &opts)
 	if err != nil {
-		fmt.Println("Error fetching pull requests:", err)
+		fmt.Println("Failed to fetch pull requests:", err)
+		return []github.PullRequest{}
 	}
 	return prs
 }
 
-func pullRequestIsOld(client github.Client, pr github.PullRequest) bool {
-	return pr.CreatedAt.Before(time.Now().Add(-72 * time.Hour))
+func pullRequestIsOld(client github.Client, pr github.PullRequest, ageThreshold int) bool {
+	return pr.CreatedAt.Before(time.Now().Add(time.Duration(-24 * ageThreshold) * time.Hour))
 }
 
-func notifyPullRequest(client github.Client, pr github.PullRequest) {
-	fmt.Printf("Pull Request is %d days old: %s\n", int(time.Since(*pr.CreatedAt).Hours()/24), *pr.HTMLURL)
+func notifyPullRequest(notification PrWithToken, room string) {
+	message := fmt.Sprintf("PR is %d days old: %s", int(time.Since(*notification.Pr.CreatedAt).Hours()/24), *notification.Pr.HTMLURL)
+	client := hipchat.Client{AuthToken: notification.Token}
+	req := hipchat.MessageRequest{
+		RoomId:        room,
+		From:          "Old PR Checker",
+		Message:       message,
+		Color:         hipchat.ColorRed,
+		MessageFormat: hipchat.FormatText,
+		Notify:        true,
+	}
+	fmt.Println("Sending HipChat notification:", req)
+	if err := client.PostMessage(req); err != nil {
+		fmt.Println("Failed to send HipChat notification:", err)
+	}
 }
 
 func printRateLimit(client github.Client) {
 	rate, _, err := client.RateLimit()
 	if err != nil {
-		fmt.Printf("Error fetching rate limit: %#v\n\n", err)
+		fmt.Println("Error fetching rate limit:", err)
 	} else {
 		remaining := int(rate.Reset.Sub(time.Now()).Seconds())
 		mins := remaining / 60
