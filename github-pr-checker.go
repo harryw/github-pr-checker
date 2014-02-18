@@ -32,12 +32,17 @@ func (this ByCreatedAt) Swap(i, j int) {
 }
 
 func main() {
+	var orgName string; flag.StringVar(&orgName, "org", "", "Check repos owned by the specified GitHub organization")
 	var hipchatRoomName string; flag.StringVar(&hipchatRoomName, "room", "", "Exclusively notify the specified HipChat room")
 	var githubRepoToken string; flag.StringVar(&githubRepoToken, "repo-api-token", "", "GitHub API token with 'repo' scope")
 	var githubHookToken string; flag.StringVar(&githubHookToken, "hook-api-token", "", "GitHub API token with 'read:repo_hook' scope")
 	var ageThreshold int; flag.IntVar(&ageThreshold, "days", 3, "Number of days old the PR may be before considering it old")
 	flag.Parse()
 
+	if orgName == "" {
+		fmt.Println("Please provide a valid value for org")
+		return
+	}
 	if githubRepoToken == "" {
 		fmt.Println("Please provide a valid value for repo-api-token")
 		return
@@ -53,7 +58,7 @@ func main() {
 
 	repos := make(chan github.Repository, 10)
 	getReposDone := make(chan bool, 1)
-	go getRepos(client, repos, getReposDone)
+	go getRepos(client, repos, getReposDone, orgName)
 
 	confirmedRepos := make(chan RepoWithToken, 100)
 	roomReposDone := make(chan bool, 1)
@@ -120,10 +125,10 @@ func createClient(token string) github.Client {
 	return *github.NewClient(t.Client())
 }
 
-func getRepos(client github.Client, repos chan github.Repository, done chan bool)  {
+func getRepos(client github.Client, repos chan github.Repository, done chan bool, org string)  {
 	opt := &github.RepositoryListByOrgOptions{Type: "all", ListOptions:github.ListOptions{Page:1}}
 	for {
-		reposPage, response, err := client.Repositories.ListByOrg("mdsol", opt)
+		reposPage, response, err := client.Repositories.ListByOrg(org, opt)
 		for _, repo := range reposPage {
 			repos <- repo
 		}

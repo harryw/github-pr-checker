@@ -11,6 +11,7 @@ HipChat room.
 The utility accepts a number of command-line options:
 
 ```bash
+-org <org>                  Check repos owned by the specified GitHub organization
 -room <room>                Exclusively notify the specified HipChat room
 -repo-api-token <token>     GitHub API token with 'repo' scope
 -hook-api-token <token>     GitHub API token with 'read:repo_hook' scope
