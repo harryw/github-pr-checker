@@ -10,22 +10,12 @@ import (
 	"flag"
 )
 
-type RepoWithToken struct {
-	Repo github.Repository
-	Token string
-}
-
-type PrWithToken struct {
-	Pr github.PullRequest
-	Token string
-}
-
-type ByCreatedAt []PrWithToken
+type ByCreatedAt []github.PullRequest
 func (this ByCreatedAt) Len() int {
 	return len(this)
 }
 func (this ByCreatedAt) Less(i, j int) bool {
-	return this[i].Pr.CreatedAt.Before(*this[j].Pr.CreatedAt)
+	return this[i].CreatedAt.Before(*this[j].CreatedAt)
 }
 func (this ByCreatedAt) Swap(i, j int) {
 	this[i], this[j] = this[j], this[i]
@@ -34,6 +24,7 @@ func (this ByCreatedAt) Swap(i, j int) {
 func main() {
 	var orgName string; flag.StringVar(&orgName, "org", "", "Check repos owned by the specified GitHub organization")
 	var hipchatRoomName string; flag.StringVar(&hipchatRoomName, "room", "", "Exclusively notify the specified HipChat room")
+	var hipchatToken string; flag.StringVar(&hipchatToken, "hipchat-api-token", "", "HipChat API token used for notifications")
 	var githubRepoToken string; flag.StringVar(&githubRepoToken, "repo-api-token", "", "GitHub API token with 'repo' scope")
 	var githubHookToken string; flag.StringVar(&githubHookToken, "hook-api-token", "", "GitHub API token with 'read:repo_hook' scope")
 	var ageThreshold int; flag.IntVar(&ageThreshold, "days", 3, "Number of days old the PR may be before considering it old")
@@ -51,6 +42,10 @@ func main() {
 		fmt.Println("Please provide a valid value for hook-api-token")
 		return
 	}
+	if hipchatToken == "" {
+		fmt.Println("Please provide a valid value for hipchat-api-token")
+		return
+	}
 
 	fmt.Println("searching for repos with HipChat hooks...")
 
@@ -60,29 +55,29 @@ func main() {
 	getReposDone := make(chan bool, 1)
 	go getRepos(client, repos, getReposDone, orgName)
 
-	confirmedRepos := make(chan RepoWithToken, 100)
+	confirmedRepos := make(chan github.Repository, 100)
 	roomReposDone := make(chan bool, 1)
 	hookReaderClient := createClient(githubHookToken)
 	go roomRepos(hookReaderClient, repos, confirmedRepos, roomReposDone, hipchatRoomName)
 
-	notifications := make(chan PrWithToken, 100)
+	notifications := make(chan github.PullRequest, 100)
 	notificationChecks := make(chan string, 100)
 	notificationCheckCount := 0
 
 	for {
-		repoWithToken, ok := <-confirmedRepos
+		repo, ok := <-confirmedRepos
 		if !ok {
 			break //channel closed
 		}
 		notificationCheckCount++
 		go func() {
-			prs := getOpenPullRequests(client, repoWithToken.Repo)
+			prs := getOpenPullRequests(client, repo)
 			for _, pr := range prs {
-				if pullRequestIsOld(client, pr, ageThreshold) {
-					notifications <- PrWithToken{Pr: pr, Token: repoWithToken.Token}
+				if pullRequestIsOld(pr, ageThreshold) {
+					notifications <- pr
 				}
 			}
-			notificationChecks <- *repoWithToken.Repo.Name
+			notificationChecks <- *repo.Name
 		}()
 	}
 
@@ -98,7 +93,7 @@ func main() {
 
 	fmt.Println("finished checking PRs")
 
-	notificationsArray := make([]PrWithToken, len(notifications))
+	notificationsArray := make([]github.PullRequest, len(notifications))
 	notificationIndex := 0
 	for len(notifications) > 0 {
 		notificationsArray[notificationIndex] = <-notifications
@@ -111,7 +106,7 @@ func main() {
 	sort.Sort(ByCreatedAt(notificationsArray))
 
 	for _, notification := range notificationsArray {
-		notifyPullRequest(notification, hipchatRoomName)
+		notifyPullRequest(notification, hipchatRoomName, hipchatToken)
 	}
 
 	printRateLimit(client)
@@ -149,7 +144,7 @@ func getRepos(client github.Client, repos chan github.Repository, done chan bool
 	done <- true
 }
 
-func roomRepos(client github.Client, repos chan github.Repository, confirmedRepos chan RepoWithToken, done chan bool, roomName string) {
+func roomRepos(client github.Client, repos chan github.Repository, confirmedRepos chan github.Repository, done chan bool, roomName string) {
 	checkCount := 0
 	checkCompleteChan := make(chan string, 10)
 	for {
@@ -169,7 +164,7 @@ func roomRepos(client github.Client, repos chan github.Repository, confirmedRepo
 				if *hook.Name == "hipchat" {
 						if roomName == "" || hook.Config["room"] == roomName {
 	//					fmt.Print("!")
-						confirmedRepos <- RepoWithToken{Repo: repo, Token: hook.Config["auth_token"].(string)}
+						confirmedRepos <- repo
 						break
 					}
 				}
@@ -195,16 +190,16 @@ func getOpenPullRequests(client github.Client, repo github.Repository) []github.
 	return prs
 }
 
-func pullRequestIsOld(client github.Client, pr github.PullRequest, ageThreshold int) bool {
+func pullRequestIsOld(pr github.PullRequest, ageThreshold int) bool {
 	return pr.CreatedAt.Before(time.Now().Add(time.Duration(-24 * ageThreshold) * time.Hour))
 }
 
-func notifyPullRequest(notification PrWithToken, room string) {
-	message := fmt.Sprintf("PR is %d days old: %s", int(time.Since(*notification.Pr.CreatedAt).Hours()/24), *notification.Pr.HTMLURL)
-	client := hipchat.Client{AuthToken: notification.Token}
+func notifyPullRequest(pr github.PullRequest, room string, token string) {
+	message := fmt.Sprintf("PR is %d days old: %s", int(time.Since(*pr.CreatedAt).Hours()/24), *pr.HTMLURL)
+	client := hipchat.Client{AuthToken: token}
 	req := hipchat.MessageRequest{
 		RoomId:        room,
-		From:          "Old PR Checker",
+		From:          "PR Checker",
 		Message:       message,
 		Color:         hipchat.ColorRed,
 		MessageFormat: hipchat.FormatText,
